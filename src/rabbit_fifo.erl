@@ -236,6 +236,8 @@
                                         PrefixMsgs :: non_neg_integer()},
          msg_bytes_enqueue = 0 :: non_neg_integer(),
          msg_bytes_checkout = 0 :: non_neg_integer(),
+         max_length :: maybe(non_neg_integer()),
+         max_bytes :: maybe(non_neg_integer()),
          %% whether single active consumer is on or not for this queue
          consumer_strategy = default :: default | single_active,
          %% waiting consumers, one is picked active consumer is cancelled or dies
@@ -250,6 +252,8 @@
                     dead_letter_handler => applied_mfa(),
                     become_leader_handler => applied_mfa(),
                     shadow_copy_interval => non_neg_integer(),
+                    max_length => non_neg_integer(),
+                    max_bytes => non_neg_integer(),
                     single_active_consumer_on => boolean()}.
 
 -export_type([protocol/0,
@@ -277,6 +281,8 @@ update_config(Conf, State) ->
     DLH = maps:get(dead_letter_handler, Conf, undefined),
     BLH = maps:get(become_leader_handler, Conf, undefined),
     SHI = maps:get(shadow_copy_interval, Conf, ?SHADOW_COPY_INTERVAL),
+    MaxLength = maps:get(max_length, Conf, undefined),
+    MaxBytes = maps:get(max_bytes, Conf, undefined),
     ConsumerStrategy = case maps:get(single_active_consumer_on, Conf, false) of
                            true ->
                                single_active;
@@ -286,6 +292,8 @@ update_config(Conf, State) ->
     State#state{dead_letter_handler = DLH,
                 become_leader_handler = BLH,
                 shadow_copy_interval = SHI,
+                max_length = MaxLength,
+                max_bytes = MaxBytes,
                 consumer_strategy = ConsumerStrategy}.
 
 zero(_) ->
@@ -293,22 +301,11 @@ zero(_) ->
 
 % msg_ids are scoped per consumer
 % ra_indexes holds all raft indexes for enqueues currently on queue
--spec apply(ra_machine:command_meta_data(), command(),
-            state()) ->
-    {state(), Reply :: term(), ra_machine:effects()}.
-apply(#{index := RaftIdx}, #enqueue{pid = From, seq = Seq,
-                                    msg = RawMsg}, State00) ->
-    case maybe_enqueue(RaftIdx, From, Seq, RawMsg, [], State00) of
-        {ok, State0, Effects1} ->
-            %% need to checkout before capturing the shadow copy else
-            %% snapshots may not be complete
-            {State, ok, Effects} = checkout(
-                                     add_bytes_enqueue(RawMsg, State0),
-                                     Effects1),
-            append_to_master_index(RaftIdx, Effects, State);
-        {duplicate, State, Effects} ->
-            {State, ok, lists:reverse(Effects)}
-    end;
+-spec apply(ra_machine:command_meta_data(), command(), state()) ->
+    {state(), ra_machine:effects(), Reply :: term()}.
+apply(Metadata, #enqueue{pid = From, seq = Seq,
+                         msg = RawMsg}, State00) ->
+    apply_enqueue(Metadata, From, Seq, RawMsg, State00);
 apply(#{index := RaftIdx},
       #settle{msg_ids = MsgIds, consumer_id = ConsumerId},
       #state{consumers = Cons0} = State) ->
@@ -823,6 +820,34 @@ cancel_consumer0(ConsumerId,
             {Effects0, S0}
     end.
 
+apply_enqueue(#{index := RaftIdx}, From, Seq, RawMsg, State0) ->
+    Bytes = message_size(RawMsg),
+    WillOverflow = will_overflow(Bytes, State0),
+    {State1, ok, Effects1} = case WillOverflow of
+                                 true -> drop_head(RaftIdx, State0);
+                                 false -> {State0, ok, []}
+                             end,
+    case maybe_enqueue(RaftIdx, From, Seq, RawMsg, Effects1, State1) of
+        {ok, State2, Effects2} ->
+            {State, ok, Effects} = checkout(add_bytes_enqueue(Bytes, State2),
+                                            Effects2),
+            append_to_master_index(RaftIdx, Effects, State);
+        {duplicate, State, Effects} ->
+            {State, ok, Effects}
+    end.
+
+drop_head(RaftIdx, #state{ra_indexes = Indexes} = State) ->
+    %% Delete bytes
+    case take_next_msg(State) of
+        {ConsumerMsg, State0, Messages} ->
+            update_smallest_raft_index(
+              RaftIdx, Indexes,
+              State0#state{messages = Messages},
+              dead_letter_effects(maps:put(none, ConsumerMsg, #{}), State0, []));
+        error ->
+            {State, ok, []}
+    end.
+
 enqueue(RaftIdx, RawMsg, #state{messages = Messages,
                                 low_msg_num = LowMsgNum,
                                 next_msg_num = NextMsgNum} = State0) ->
@@ -861,7 +886,8 @@ enqueue_pending(From, Enq, #state{enqueuers = Enqueuers0} = State) ->
 maybe_enqueue(RaftIdx, undefined, undefined, RawMsg, Effects,
               State0) ->
     % direct enqueue without tracking
-    {ok, enqueue(RaftIdx, RawMsg, State0), Effects};
+    State = enqueue(RaftIdx, RawMsg, State0),
+    {ok, State, Effects};
 maybe_enqueue(RaftIdx, From, MsgSeqNo, RawMsg, Effects0,
               #state{enqueuers = Enqueuers0} = State0) ->
     case maps:get(From, Enqueuers0, undefined) of
@@ -1164,7 +1190,6 @@ checkout_one(#state{service_queue = SQ0,
             end
     end.
 
-
 update_or_remove_sub(ConsumerId, #consumer{lifetime = auto,
                                            credit = 0} = Con,
                      Cons, ServiceQueue, Effects) ->
@@ -1279,6 +1304,15 @@ dehydrate_consumer(#consumer{checked_out = Checked0} = Con) ->
     Checked = maps:map(fun (_, _) -> '$prefix_msg' end, Checked0),
     Con#consumer{checked_out = Checked}.
 
+will_overflow(_Bytes, #state{max_length = undefined,
+                                    max_bytes = undefined}) ->
+    false;
+will_overflow(Bytes, #state{max_length = MaxLength, ra_indexes = Indexes,
+                            max_bytes = MaxBytes, msg_bytes_enqueue = BytesEnq} = State) ->
+    ExpectedSize = Bytes + BytesEnq,
+    ((rabbit_fifo_index:size(Indexes) - num_checked_out(State)) >= MaxLength)
+        orelse (ExpectedSize > MaxBytes).
+
 -spec make_enqueue(maybe(pid()), maybe(msg_seqno()), raw_msg()) -> protocol().
 make_enqueue(Pid, Seq, Msg) ->
     #enqueue{pid = Pid, seq = Seq, msg = Msg}.
@@ -1315,8 +1349,7 @@ make_purge() -> #purge{}.
 make_update_config(Config) ->
     #update_config{config = Config}.
 
-add_bytes_enqueue(Msg, #state{msg_bytes_enqueue = Enqueue} = State) ->
-    Bytes = message_size(Msg),
+add_bytes_enqueue(Bytes, #state{msg_bytes_enqueue = Enqueue} = State) ->
     State#state{msg_bytes_enqueue = Enqueue + Bytes}.
 
 add_bytes_checkout(Msg, #state{msg_bytes_checkout = Checkout,
@@ -1677,7 +1710,7 @@ down_with_noconnection_returns_unack_test() ->
 down_with_noproc_enqueuer_is_cleaned_up_test() ->
     State00 = test_init(test),
     Pid = spawn(fun() -> ok end),
-    {State0, _, Effects0} = apply(meta(1), {enqueue, Pid, 1, first}, State00),
+    {State0, _, Effects0} = apply(meta(1), make_enqueue(Pid, 1, first), State00),
     ?ASSERT_EFF({monitor, process, _}, Effects0),
     {State1, _, _} = apply(meta(3), {down, Pid, noproc}, State0),
     % ensure there are no enqueuers
