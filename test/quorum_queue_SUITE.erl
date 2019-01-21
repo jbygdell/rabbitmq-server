@@ -22,6 +22,7 @@
 
 -import(quorum_queue_utils, [wait_for_messages_ready/3,
                              wait_for_messages_pending_ack/3,
+                             wait_for_messages_total/3,
                              dirty_query/3,
                              ra_name/1]).
 
@@ -2166,6 +2167,7 @@ queue_length_limit_drop_head(Config) ->
     wait_for_consensus(QQ, Config),
     wait_for_messages_ready(Servers, RaName, 1),
     wait_for_messages_pending_ack(Servers, RaName, 0),
+    wait_for_messages_total(Servers, RaName, 1),
     ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"msg2">>}},
                  amqp_channel:call(Ch, #'basic.get'{queue = QQ,
                                                     no_ack = true})).

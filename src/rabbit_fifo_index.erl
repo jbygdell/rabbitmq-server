@@ -9,7 +9,8 @@
          size/1,
          smallest/1,
          next_key_after/2,
-         map/2
+         map/2,
+         all/1
         ]).
 
 -include_lib("ra/include/ra.hrl").
@@ -75,6 +76,10 @@ delete(Key, #?MODULE{data = Data} = State) ->
 -spec size(state()) -> non_neg_integer().
 size(#?MODULE{data = Data}) ->
     maps:size(Data).
+
+-spec all(state()) -> #{integer() => term()}.
+all(#?MODULE{data = Data}) ->
+    Data.
 
 -spec smallest(state()) -> undefined | {integer(), term()}.
 smallest(#?MODULE{smallest = undefined}) ->

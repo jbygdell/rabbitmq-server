@@ -5,6 +5,7 @@
 -export([
          wait_for_messages_ready/3,
          wait_for_messages_pending_ack/3,
+         wait_for_messages_total/3,
          dirty_query/3,
          ra_name/1
         ]).
@@ -16,6 +17,10 @@ wait_for_messages_ready(Servers, QName, Ready) ->
 wait_for_messages_pending_ack(Servers, QName, Ready) ->
     wait_for_messages(Servers, QName, Ready,
                       fun rabbit_fifo:query_messages_checked_out/1, 60).
+
+wait_for_messages_total(Servers, QName, Total) ->
+    wait_for_messages(Servers, QName, Total,
+                      fun rabbit_fifo:query_messages_total/1, 60).
 
 wait_for_messages(Servers, QName, Number, Fun, 0) ->
     Msgs = dirty_query(Servers, QName, Fun),

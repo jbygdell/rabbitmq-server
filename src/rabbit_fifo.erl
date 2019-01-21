@@ -38,6 +38,7 @@
          % queries
          query_messages_ready/1,
          query_messages_checked_out/1,
+         query_messages_total/1,
          query_processes/1,
          query_ra_indexes/1,
          query_consumer_count/1,
@@ -690,6 +691,9 @@ query_messages_checked_out(#state{consumers = Consumers}) ->
                       maps:merge(S, maps:from_list(maps:values(C)))
               end, #{}, Consumers).
 
+query_messages_total(#state{ra_indexes = Indexes}) ->
+    rabbit_fifo_index:all(Indexes).
+
 query_processes(#state{enqueuers = Enqs, consumers = Cons0}) ->
     Cons = maps:fold(fun({_, P}, V, S) -> S#{P => V} end, #{}, Cons0),
     maps:keys(maps:merge(Enqs, Cons)).
@@ -836,13 +840,15 @@ apply_enqueue(#{index := RaftIdx}, From, Seq, RawMsg, State0) ->
             {State, ok, Effects}
     end.
 
-drop_head(RaftIdx, #state{ra_indexes = Indexes} = State) ->
+drop_head(RaftIdx, #state{ra_indexes = Indexes0} = State) ->
     %% Delete bytes
     case take_next_msg(State) of
-        {ConsumerMsg, State0, Messages} ->
+        {ConsumerMsg = {_, {RaftIdxToDrop, _}}, State0, Messages} ->
+            Indexes = lists:foldl(fun rabbit_fifo_index:delete/2, Indexes0, [RaftIdxToDrop]),
             update_smallest_raft_index(
               RaftIdx, Indexes,
-              State0#state{messages = Messages},
+              State0#state{messages = Messages,
+                           ra_indexes = Indexes},
               dead_letter_effects(maps:put(none, ConsumerMsg, #{}), State0, []));
         error ->
             {State, ok, []}
